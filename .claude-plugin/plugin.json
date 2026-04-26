@@ -1,0 +1,9 @@
+{
+  "name": "gwx",
+  "description": "Multi-account wrapper around Google's gws CLI. Enforces explicit per-account selection across Gmail, Drive, Calendar, Sheets, Docs, Chat, and Admin.",
+  "version": "0.1.0",
+  "author": {
+    "name": "pA1nD"
+  },
+  "license": "MIT"
+}

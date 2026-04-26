@@ -1,0 +1,6 @@
+# local
+*.bak.*
+.DS_Store
+
+# tests scratch
+/tests/.tmp/

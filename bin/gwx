@@ -1,0 +1,730 @@
+#!/usr/bin/env bash
+# gwx — multi-account wrapper around gws (Google Workspace CLI).
+# Forces explicit account selection. Allows parallel read fan-out.
+# Refuses fan-out for write/unknown verbs (default-deny).
+
+set -euo pipefail
+
+GWX_HOME="${GWX_HOME:-$HOME/.config/gwx}"
+GWX_ACCOUNTS_DIR="$GWX_HOME/accounts"
+GWX_ACCOUNTS_FILE="$GWX_HOME/accounts.list"
+GWX_TIMEOUT="${GWX_TIMEOUT:-30}"
+
+RESERVED_WORDS=(init login logout remove whoami skills help all)
+READ_VERBS=(list get search schema +triage +agenda +read)
+GWX_CACHE_DIR="${GWX_CACHE_DIR:-$HOME/.cache/gwx}"
+GWX_SKILLS_SRC="$GWX_CACHE_DIR/skills-src"
+GWS_REPO_URL="${GWS_REPO_URL:-https://github.com/googleworkspace/cli}"
+
+err()  { printf 'gwx: %s\n' "$*" >&2; }
+die()  { err "$1"; exit "${2:-1}"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Resolve the absolute path to the gws binary. Priority:
+#   1. GWX_GWS_BIN env override (for testing or explicit pinning).
+#   2. $GWX_HOME/gws_bin — written by install.sh when gws was detected.
+#   3. Whatever 'gws' resolves to in $PATH (last-resort fallback).
+# Pinning at install time matters because anything earlier in $PATH at
+# call time (e.g. an attacker-controlled ~/.local/bin/gws) would otherwise
+# get the OAuth client_id+secret env-exported into it.
+GWS_BIN=""
+resolve_gws_bin() {
+  if [[ -n "${GWX_GWS_BIN:-}" ]]; then
+    GWS_BIN="$GWX_GWS_BIN"
+  elif [[ -f "$GWX_HOME/gws_bin" ]]; then
+    GWS_BIN="$(cat "$GWX_HOME/gws_bin" 2>/dev/null)"
+  fi
+  if [[ -n "$GWS_BIN" && -x "$GWS_BIN" ]]; then return 0; fi
+  GWS_BIN="$(command -v gws 2>/dev/null || true)"
+}
+ensure_gws() {
+  resolve_gws_bin
+  [[ -n "$GWS_BIN" ]] || die "gws not installed. install with: npm install -g @googleworkspace/cli" 4
+}
+
+is_reserved() {
+  local w="$1" r
+  [[ "$w" == -* ]] && return 0
+  for r in "${RESERVED_WORDS[@]}"; do [[ "$w" == "$r" ]] && return 0; done
+  return 1
+}
+
+load_accounts() {
+  [[ -f "$GWX_ACCOUNTS_FILE" ]] || die "not initialized — run 'gwx init'" 4
+  ACCOUNTS=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "${line// }" || "$line" =~ ^[[:space:]]*# ]] && continue
+    ACCOUNTS+=("$line")
+  done < "$GWX_ACCOUNTS_FILE"
+  [[ "${#ACCOUNTS[@]}" -gt 0 ]] || die "no accounts configured — run 'gwx init'" 4
+}
+
+is_account() {
+  local w="$1" a
+  for a in "${ACCOUNTS[@]}"; do [[ "$w" == "$a" ]] && return 0; done
+  return 1
+}
+
+is_read_args() {
+  # Match read verbs only in positional args (before the first --flag).
+  # Stops scanning as soon as we hit a flag, so a `--subject list` value can't
+  # masquerade as the verb and unlock fan-out for an actual write command.
+  local a v
+  for a in "$@"; do
+    [[ "$a" == -* ]] && break
+    for v in "${READ_VERBS[@]}"; do [[ "$a" == "$v" ]] && return 0; done
+  done
+  return 1
+}
+
+print_help() {
+  cat <<'EOF'
+gwx — multi-account wrapper around gws (Google Workspace CLI)
+
+USAGE
+  gwx <account>     <gws args...>     run against one account
+  gwx <a,b>         <gws args...>     fan-out (read verbs only) — NDJSON output
+  gwx all           <gws args...>     fan-out across every account
+  gwx <subcommand>  [args]            wrapper-level commands (see SUBCOMMANDS)
+
+DISCOVERING GWS SERVICES & VERBS
+  gwx <account> --help                ←  shows the full gws CLI surface (gmail,
+                                         drive, calendar, sheets, docs, chat,
+                                         admin, +helpers, …). Auto-updates as
+                                         gws ships new APIs. Use this when you
+                                         don't know which command to run.
+  gwx <account> <service> --help      drill into one service
+                                      e.g. gwx work gmail --help
+
+SUBCOMMANDS
+  init    <name>                      add an account; prompts for OAuth client
+                                      (offers to reuse from any existing account)
+  login   <account>                   OAuth flow for one account
+  logout  <account>                   clear credentials (keep alias)
+  remove  <account>                   delete account entirely (alias + creds + client)
+  whoami                              email + auth status for every account
+  skills install [opts]               install rewritten gws workflow skills
+                                      into <cwd>/.claude/skills/ — see
+                                      'gwx skills --help' for options
+  skills uninstall                    remove rewritten gws skills from cwd
+
+EXAMPLES
+  Single-account read:
+    gwx work gmail +triage
+    gwx personal calendar +agenda --today
+
+  Fan-out read (NDJSON per account):
+    gwx all gmail messages list --params '{"q":"q3 review","maxResults":5}'
+    gwx work,personal calendar +agenda --today
+
+  Single-account write (fan-out is refused for writes):
+    gwx work gmail +send --to a@b.c --subject hi --body hi
+    gwx personal drive +upload ./report.pdf
+
+  Pipe the fan-out:
+    gwx all gmail messages list --params '{"q":"invoice"}' \
+      | jq -s 'map(select(.exit==0) | .stdout.messages[]) | length'
+
+FAN-OUT RULES
+  Multi-account fan-out is allowed only when the args contain a known read verb:
+    list, get, search, schema, +triage, +agenda, +read
+  Anything else (writes, unknown verbs) must target a single account.
+
+EXIT CODES
+  0   success
+  2   bad usage (missing/unknown account)
+  3   fan-out refused (write/unknown verb)
+  4   account not authenticated / not initialized
+  *   passed through from gws
+
+CONFIG
+  ~/.config/gwx/                       wrapper home (mode 0700)
+  ~/.config/gwx/accounts.list          one account alias per line
+  ~/.config/gwx/accounts/<name>/       per-account home (0700)
+    ├── client.env       (0600)        OAuth client_id + secret
+    ├── credentials.enc  (0600)        refresh token, AES-256-GCM
+    └── token_cache.json (0600)        access token, encrypted
+  ~/.cache/gwx/skills-src/           shallow clone of gws repo (skills source)
+  <cwd>/.claude/skills/<name>/       rewritten skills (per agent project)
+  <cwd>/.claude/skills/.gwx-manifest.json   tracks installed skills + SHA
+EOF
+}
+
+print_skills_help() {
+  cat <<'EOF'
+gwx skills — manage rewritten gws workflow skills in the current project
+
+USAGE
+  gwx skills install [opts]                 fetch + rewrite + install gws-* skills
+                                            into <cwd>/.claude/skills/
+  gwx skills uninstall                      remove all installed skills (+ manifest)
+  gwx skills uninstall --skill <name>...    remove specific skills only
+
+INSTALL OPTIONS
+  --skill <name>...   install only specified skill names (always adds gws-shared)
+  --recipes           include recipe-* skills (concrete workflows)
+  --personas          include persona-* skills (role-based skills)
+  --all               include everything (gws-*, recipe-*, persona-*)
+
+DEFAULT (no flags)   installs every gws-* skill (the per-service workflow files)
+
+EXAMPLES
+  cd ~/aip/X002\ -\ Atelier/_agents/officeworker && gwx skills install
+  gwx skills install --skill gws-gmail gws-drive    # subset
+  gwx skills install --all                          # everything
+  gwx skills uninstall
+
+The rewriter adds a ">**NOTE FOR AGENTS:**" banner explaining the gwx wrapper,
+then rewrites every gws command (in code blocks, inline backticks, single-quoted
+prose, and cliHelp metadata) to use 'gwx <account> ...' syntax.
+EOF
+}
+
+prompt_oauth_client() {
+  # writes a client.env on stdout — prompts the user for client_id/secret on stderr
+  echo "OAuth client for this account." >&2
+  echo "Get one from https://console.cloud.google.com → APIs & Services → Credentials" >&2
+  echo "→ Create OAuth client ID → Desktop application." >&2
+  local cid csec
+  read -rp "client_id: " cid
+  read -rsp "client_secret: " csec; echo >&2
+  [[ -n "$cid" && -n "$csec" ]] || die "client_id and client_secret required" 2
+  # Single-quote the values so `source client.env` treats them as literal data.
+  # Replaces any embedded ' with '\'' (close-quote, escaped quote, re-open-quote).
+  local cid_esc=${cid//\'/\'\\\'\'}
+  local csec_esc=${csec//\'/\'\\\'\'}
+  cat <<EOF
+# OAuth client for this account
+GOOGLE_WORKSPACE_CLI_CLIENT_ID='$cid_esc'
+GOOGLE_WORKSPACE_CLI_CLIENT_SECRET='$csec_esc'
+EOF
+}
+
+# discover_clients: prints "label\tpath" per available OAuth client.env
+discover_clients() {
+  local f
+  for f in "$GWX_ACCOUNTS_DIR"/*/client.env; do
+    [[ -f "$f" ]] || continue
+    printf '%s\t%s\n' "$(basename "$(dirname "$f")")" "$f"
+  done
+}
+
+# add_one_account: validates alias, prompts for OAuth (with reuse option), writes files
+add_one_account() {
+  local alias="$1"
+  validate_alias "$alias"
+  if grep -qE "^${alias}\$" "$GWX_ACCOUNTS_FILE" 2>/dev/null; then
+    err "alias '$alias' already exists, skipping"
+    return 0
+  fi
+
+  local dir="$GWX_ACCOUNTS_DIR/$alias"
+  local client_dest="$dir/client.env"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+
+  local -a labels=() paths=()
+  local line label path
+  while IFS=$'\t' read -r label path; do
+    [[ -n "$label" ]] || continue
+    labels+=("$label"); paths+=("$path")
+  done < <(discover_clients)
+
+  if [[ "${#labels[@]}" -gt 0 ]]; then
+    echo
+    echo "Existing OAuth clients:"
+    local i=0
+    while [[ "$i" -lt "${#labels[@]}" ]]; do
+      printf '  %d) %s\n' "$((i+1))" "${labels[$i]}"
+      i=$((i+1))
+    done
+    echo "  n) provide a new client"
+    local choice
+    read -rp "Reuse which? [1-${#labels[@]} or n, default 1]: " choice
+    choice="${choice:-1}"
+    if [[ "$choice" == "n" || "$choice" == "new" || "$choice" == "N" ]]; then
+      prompt_oauth_client > "$client_dest"
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#labels[@]} )); then
+      cp "${paths[$((choice-1))]}" "$client_dest"
+      echo "✓ copied OAuth client from '${labels[$((choice-1))]}'"
+    else
+      die "invalid choice: $choice" 2
+    fi
+  else
+    prompt_oauth_client > "$client_dest"
+  fi
+  chmod 600 "$client_dest"
+
+  echo "$alias" >> "$GWX_ACCOUNTS_FILE"
+  echo "✓ added '$alias' — next: gwx login $alias"
+}
+
+cmd_init() {
+  mkdir -p "$GWX_HOME" "$GWX_ACCOUNTS_DIR"
+  chmod 700 "$GWX_HOME" "$GWX_ACCOUNTS_DIR"
+  [[ -f "$GWX_ACCOUNTS_FILE" ]] || { touch "$GWX_ACCOUNTS_FILE"; chmod 600 "$GWX_ACCOUNTS_FILE"; }
+
+  local alias="${1:-}"
+  if [[ -z "$alias" ]]; then
+    read -rp "account alias: " alias
+    [[ -n "$alias" ]] || die "alias required (usage: gwx init <name>)" 2
+  fi
+  add_one_account "$alias"
+}
+
+scoped_env() {
+  local account="$1"
+  [[ -d "$GWX_ACCOUNTS_DIR/$account" ]] || die "account dir missing: $GWX_ACCOUNTS_DIR/$account — run 'gwx init $account'" 4
+  local client="$GWX_ACCOUNTS_DIR/$account/client.env"
+  [[ -f "$client" ]] || die "no OAuth client for '$account' — run 'gwx init $account'" 4
+  set -a
+  # shellcheck disable=SC1090
+  source "$client"
+  set +a
+  export GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$GWX_ACCOUNTS_DIR/$account"
+  # Intentionally NOT setting GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND.
+  # gws's default ("keyring") uses macOS Keychain / Windows Credential Manager
+  # for the AES key — a real OS-level secret store. Forcing "file" would
+  # downgrade us to a key sitting next to the ciphertext (security theater).
+  # All gwx accounts share one keyring entry (gws-cli/<user>), which is fine:
+  # they all run as the same OS user, and ciphertexts stay isolated by
+  # per-account config dir. On Linux, gws's keyring path is compiled out
+  # and it uses the file backend regardless — no regression there.
+}
+
+cmd_login() {
+  load_accounts
+  local account="${1:-}"
+  [[ -n "$account" ]] || die "usage: gwx login <account>" 2
+  is_account "$account" || die "unknown account '$account'. valid: ${ACCOUNTS[*]}" 2
+  ensure_gws
+  scoped_env "$account"
+  exec "$GWS_BIN" auth login
+}
+
+validate_alias() {
+  local a="$1"
+  if is_reserved "$a"; then
+    die "alias '$a' collides with reserved keyword (init|login|logout|whoami|skills|account|help|all) or starts with '-'" 2
+  fi
+  if [[ ! "$a" =~ ^[a-z0-9_][a-z0-9_-]*$ ]]; then
+    die "alias '$a' invalid (use lowercase letters, digits, _, -)" 2
+  fi
+}
+
+cmd_remove() {
+  load_accounts
+  local a="${1:-}"
+  [[ -n "$a" ]] || die "usage: gwx remove <account>" 2
+  is_account "$a" || die "unknown account '$a'. valid: ${ACCOUNTS[*]}" 2
+  local tmp="$GWX_ACCOUNTS_FILE.tmp.$$"
+  grep -v "^${a}\$" "$GWX_ACCOUNTS_FILE" > "$tmp" && mv "$tmp" "$GWX_ACCOUNTS_FILE"
+  rm -rf "$GWX_ACCOUNTS_DIR/$a"
+  echo "✓ removed '$a' (alias + credentials + OAuth client)"
+}
+
+
+cmd_logout() {
+  load_accounts
+  local account="${1:-}"
+  [[ -n "$account" ]] || die "usage: gwx logout <account>" 2
+  is_account "$account" || die "unknown account '$account'. valid: ${ACCOUNTS[*]}" 2
+  local dir="$GWX_ACCOUNTS_DIR/$account"
+  rm -f "$dir/credentials.enc" "$dir/token_cache.json" "$dir/sa_token_cache.json" "$dir/.encryption_key" "$dir/client_secret.json"
+  echo "✓ removed credentials for '$account' (dir kept: $dir)"
+}
+
+cmd_whoami() {
+  load_accounts
+  have gws || die "gws not installed" 4
+
+  # column width based on longest alias (min 8)
+  local pad=8 a
+  for a in "${ACCOUNTS[@]}"; do (( ${#a} > pad )) && pad=${#a}; done
+  pad=$((pad + 2))
+
+  echo "Accounts:"
+  for a in "${ACCOUNTS[@]}"; do
+    if [[ ! -f "$GWX_ACCOUNTS_DIR/$a/client.env" ]]; then
+      printf '  %-*s  ?  no OAuth client — run: gwx init %s\n' "$pad" "$a" "$a"
+      continue
+    fi
+    (
+      scoped_env "$a" 2>/dev/null
+      local status method user scopes valid
+      if ! status=$(gws auth status 2>/dev/null); then
+        printf '  %-*s  ?  unable to query auth status\n' "$pad" "$a"
+        return
+      fi
+      if have jq; then
+        method=$(jq -r '.auth_method // "none"' <<<"$status")
+        user=$(jq -r '.user // ""' <<<"$status")
+        scopes=$(jq -r '.scope_count // 0' <<<"$status")
+        valid=$(jq -r '.token_valid // false' <<<"$status")
+        if [[ "$method" == "none" || -z "$user" ]]; then
+          printf '  %-*s  ✗  not logged in — run: gwx login %s\n' "$pad" "$a" "$a"
+        elif [[ "$valid" != "true" ]]; then
+          printf '  %-*s  !  %s  (token expired — run: gwx login %s)\n' "$pad" "$a" "$user" "$a"
+        else
+          printf '  %-*s  ✓  %s  (%s scopes)\n' "$pad" "$a" "$user" "$scopes"
+        fi
+      else
+        # crude fallback when jq is absent
+        if grep -q '"auth_method": *"none"' <<<"$status"; then
+          printf '  %-*s  ✗  not logged in — run: gwx login %s\n' "$pad" "$a" "$a"
+        else
+          printf '  %-*s  ✓  authenticated\n' "$pad" "$a"
+        fi
+      fi
+    )
+  done
+}
+
+run_one() {
+  local account="$1"; shift
+  (
+    scoped_env "$account"
+    if have timeout; then
+      timeout "$GWX_TIMEOUT" "$GWS_BIN" "$@"
+    else
+      "$GWS_BIN" "$@"
+    fi
+  )
+}
+
+run_one_json() {
+  local account="$1"; shift
+  local out_file err_file ec start ms stdout_json
+  out_file=$(mktemp); err_file=$(mktemp)
+  start=$(date +%s)
+  set +e
+  run_one "$account" "$@" >"$out_file" 2>"$err_file"
+  ec=$?
+  set -e
+  ms=$(( ($(date +%s) - start) * 1000 ))
+
+  if have jq; then
+    if stdout_json=$(jq -c '.' "$out_file" 2>/dev/null); then
+      jq -nc \
+        --arg account "$account" \
+        --argjson exit "$ec" \
+        --argjson ms "$ms" \
+        --argjson stdout "$stdout_json" \
+        --rawfile stderr "$err_file" \
+        '{account:$account, exit:$exit, duration_ms:$ms, stdout:$stdout, stderr:$stderr}'
+    else
+      jq -nc \
+        --arg account "$account" \
+        --argjson exit "$ec" \
+        --argjson ms "$ms" \
+        --rawfile stdout "$out_file" \
+        --rawfile stderr "$err_file" \
+        '{account:$account, exit:$exit, duration_ms:$ms, stdout:$stdout, stderr:$stderr}'
+    fi
+  else
+    printf '{"account":"%s","exit":%d,"duration_ms":%d,"raw_stdout_file":"%s"}\n' \
+      "$account" "$ec" "$ms" "$out_file"
+    return 0
+  fi
+  rm -f "$out_file" "$err_file"
+}
+
+dispatch() {
+  load_accounts
+  local spec="$1"; shift
+
+  local -a targets
+  if [[ "$spec" == "all" ]]; then
+    targets=("${ACCOUNTS[@]}")
+  elif [[ "$spec" == *,* ]]; then
+    IFS=',' read -ra targets <<<"$spec"
+  else
+    targets=("$spec")
+  fi
+
+  for t in "${targets[@]}"; do
+    if ! is_account "$t"; then
+      err "'$t' is not a known account."
+      err "valid accounts: ${ACCOUNTS[*]} (or 'all', or 'a,b' comma-list)"
+      err "subcommands: init | login | logout | remove | whoami | skills | --help"
+      err "did you forget the account? e.g. 'gwx ${ACCOUNTS[0]} $spec $*'"
+      exit 2
+    fi
+  done
+
+  # --help/-h is single-account by definition. Detect it now so we don't apply
+  # fan-out-refusal rules to help requests.
+  local has_help=0
+  for a in "$@"; do
+    if [[ "$a" == "--help" || "$a" == "-h" ]]; then has_help=1; break; fi
+  done
+
+  # Wrapper-level fan-out refusal — runs before the gws install check because
+  # the rule itself is independent of gws.
+  if [[ "${#targets[@]}" -gt 1 && "$has_help" -eq 0 ]] && ! is_read_args "$@"; then
+    err "refusing fan-out for non-read command across ${#targets[@]} accounts."
+    err "fan-out is allowed only when args contain a read verb: ${READ_VERBS[*]}"
+    err "for writes/unknown verbs, target a single account, e.g.:"
+    err "  gwx ${targets[0]} $*"
+    exit 3
+  fi
+
+  ensure_gws
+
+  # Single account, or --help short-circuit (any account's env will do).
+  if [[ "$has_help" -eq 1 || "${#targets[@]}" -eq 1 ]]; then
+    scoped_env "${targets[0]}"
+    exec "$GWS_BIN" "$@"
+  fi
+
+  have jq || err "warning: jq not found — output will be degraded"
+
+  local -a pids tmps
+  local i=0
+  for t in "${targets[@]}"; do
+    tmps[$i]=$(mktemp)
+    run_one_json "$t" "$@" >"${tmps[$i]}" &
+    pids[$i]=$!
+    i=$((i+1))
+  done
+  local fail=0
+  for i in "${!pids[@]}"; do
+    wait "${pids[$i]}" || fail=1
+    cat "${tmps[$i]}"
+    rm -f "${tmps[$i]}"
+  done
+  exit "$fail"
+}
+
+# rewrite_skill: adapt an upstream gws skill to gwx's multi-account contract.
+#
+#   - Adds a "> **NOTE FOR AGENTS:**" banner so any agent reading the skill
+#     knows it's wrapped (with link back to upstream gws docs).
+#   - Rewrites `gws X` -> `gwx <account> X` in fenced code blocks, inline
+#     backticks, single-quoted command refs, and cliHelp: metadata.
+#
+# Verified across all 95 upstream skills: 0 over-rewrites, 0 broken sibling
+# links, 1 deliberate exception (gws-shared's prose description).
+rewrite_skill() {
+  local script
+  IFS= read -r -d '' script <<'PERL' || true
+my $banner = "\n> **NOTE FOR AGENTS:** This skill describes the \x60gws\x60 CLI, but you must invoke commands as \x60gwx <account> ...\x60. Direct \x60gws\x60 is blocked by permission rules. See [googleworkspace/cli](https://github.com/googleworkspace/cli) for the underlying tool when debugging.\n";
+
+my ($fm_dashes, $fm_done, $in_code) = (0, 0, 0);
+while (<STDIN>) {
+  if (!$fm_done && /^---\s*$/) {
+    $fm_dashes++; print;
+    if ($fm_dashes == 2) { $fm_done = 1; print $banner; }
+    next;
+  }
+  if (/^\s*\x60\x60\x60/) { $in_code = !$in_code; print; next }
+  s/\x60gws\s+/\x60gwx <account> /g;
+  s/'gws\s+/'gwx <account> /g;
+  s/cliHelp: "gws\s+/cliHelp: "gwx <account> /g;
+  if ($in_code) { s/\bgws\s+/gwx <account> /g }
+  print;
+}
+PERL
+  perl -e "$script"
+}
+
+refresh_skills_src() {
+  have git || die "git not installed (needed to fetch gws skills source)" 4
+  if [[ -d "$GWX_SKILLS_SRC/.git" ]]; then
+    git -C "$GWX_SKILLS_SRC" fetch --depth 1 origin main >/dev/null 2>&1 \
+      && git -C "$GWX_SKILLS_SRC" reset --hard origin/main >/dev/null 2>&1
+  else
+    mkdir -p "$(dirname "$GWX_SKILLS_SRC")"
+    git clone --depth 1 --filter=blob:none --sparse "$GWS_REPO_URL" "$GWX_SKILLS_SRC" >/dev/null 2>&1 \
+      || die "failed to clone $GWS_REPO_URL" 4
+    git -C "$GWX_SKILLS_SRC" sparse-checkout set skills >/dev/null 2>&1
+  fi
+  [[ -d "$GWX_SKILLS_SRC/skills" ]] || die "no skills/ directory in cloned repo" 4
+}
+
+cmd_skills_install() {
+  local include_recipes=0 include_personas=0 install_all=0
+  local -a requested_skills=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --skill)
+        shift
+        while [[ $# -gt 0 && "$1" != --* ]]; do requested_skills+=("$1"); shift; done
+        ;;
+      --recipes)  include_recipes=1; shift ;;
+      --personas) include_personas=1; shift ;;
+      --all)      install_all=1; shift ;;
+      -h|--help)  print_skills_help; exit 0 ;;
+      *) die "unknown flag: $1 (run 'gwx skills --help')" 2 ;;
+    esac
+  done
+
+  echo "→ refreshing gws source at $GWX_SKILLS_SRC"
+  refresh_skills_src
+
+  # Build the list of skills to install
+  local -a target_skills=()
+  if [[ "$install_all" -eq 1 ]]; then
+    while IFS= read -r dir; do target_skills+=("$(basename "$dir")"); done \
+      < <(find "$GWX_SKILLS_SRC/skills" -maxdepth 1 -mindepth 1 -type d | sort)
+  elif [[ "${#requested_skills[@]}" -gt 0 ]]; then
+    # Always include gws-shared — every gws-* skill depends on it.
+    target_skills=("${requested_skills[@]}" "gws-shared")
+  else
+    while IFS= read -r dir; do
+      local name; name="$(basename "$dir")"
+      [[ "$name" == gws-* ]] && target_skills+=("$name")
+    done < <(find "$GWX_SKILLS_SRC/skills" -maxdepth 1 -mindepth 1 -type d | sort)
+  fi
+  if [[ "$include_recipes" -eq 1 ]]; then
+    while IFS= read -r dir; do
+      local name; name="$(basename "$dir")"
+      [[ "$name" == recipe-* ]] && target_skills+=("$name")
+    done < <(find "$GWX_SKILLS_SRC/skills" -maxdepth 1 -mindepth 1 -type d | sort)
+  fi
+  if [[ "$include_personas" -eq 1 ]]; then
+    while IFS= read -r dir; do
+      local name; name="$(basename "$dir")"
+      [[ "$name" == persona-* ]] && target_skills+=("$name")
+    done < <(find "$GWX_SKILLS_SRC/skills" -maxdepth 1 -mindepth 1 -type d | sort)
+  fi
+
+  # Dedupe (preserve order)
+  local -a uniq=()
+  local seen_marker=" "
+  for s in "${target_skills[@]}"; do
+    if [[ "$seen_marker" != *" $s "* ]]; then
+      uniq+=("$s")
+      seen_marker+="$s "
+    fi
+  done
+  target_skills=("${uniq[@]}")
+
+  [[ "${#target_skills[@]}" -gt 0 ]] || die "no skills selected to install" 2
+
+  mkdir -p ".claude/skills"
+
+  # Rewrite each
+  local count=0
+  for skill in "${target_skills[@]}"; do
+    # Refuse anything outside [a-z0-9_-]+ so a hostile upstream can't smuggle
+    # path traversal (".." / "/") into a directory it controls.
+    if ! [[ "$skill" =~ ^[a-z0-9_][a-z0-9_-]*$ ]]; then
+      err "refusing suspicious skill name: $skill"
+      continue
+    fi
+    local src="$GWX_SKILLS_SRC/skills/$skill/SKILL.md"
+    if [[ ! -f "$src" ]]; then
+      err "skill not found upstream: $skill"
+      continue
+    fi
+    mkdir -p ".claude/skills/$skill"
+    rewrite_skill < "$src" > ".claude/skills/$skill/SKILL.md"
+    count=$((count+1))
+  done
+
+  # Manifest — tracks installed skill names + upstream SHA in
+  # .claude/skills/.gwx-manifest.json so uninstall and drift checks have ground truth.
+  local sha names_json ts
+  sha="$(git -C "$GWX_SKILLS_SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if have jq; then
+    names_json="$(printf '%s\n' "${target_skills[@]}" | jq -R . | jq -s -c .)"
+  else
+    # fallback: hand-build a JSON array
+    local first=1 acc=""
+    for s in "${target_skills[@]}"; do
+      if [[ "$first" -eq 1 ]]; then acc="\"$s\""; first=0; else acc="$acc,\"$s\""; fi
+    done
+    names_json="[$acc]"
+  fi
+  printf '{"upstream_sha":"%s","installed":%s,"timestamp":"%s"}\n' \
+    "$sha" "$names_json" "$ts" > ".claude/skills/.gwx-manifest.json"
+
+  echo
+  echo "✓ installed $count skills to $(pwd)/.claude/skills/"
+  echo "  upstream SHA: ${sha:0:8}"
+  echo "  manifest:     .claude/skills/.gwx-manifest.json"
+}
+
+cmd_skills_uninstall() {
+  local -a only=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --skill)
+        shift
+        while [[ $# -gt 0 && "$1" != --* ]]; do only+=("$1"); shift; done
+        ;;
+      -h|--help)  print_skills_help; exit 0 ;;
+      *) die "unknown flag: $1" 2 ;;
+    esac
+  done
+
+  local manifest=".claude/skills/.gwx-manifest.json"
+  [[ -f "$manifest" ]] || die "no manifest at $manifest — nothing to uninstall here" 2
+
+  local -a installed=()
+  if have jq; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ -n "$line" ]] && installed+=("$line")
+    done < <(jq -r '.installed[]' "$manifest")
+  else
+    # crude fallback parser
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ -n "$line" ]] && installed+=("$line")
+    done < <(grep -oE '"[^"]+"' "$manifest" | sed 's/"//g' | grep -E '^(gws|recipe|persona)-')
+  fi
+
+  local count=0
+  for skill in "${installed[@]}"; do
+    # Defense in depth: validate names from the manifest before using as a
+    # path component, so a tampered manifest can't aim rm -rf outside the dir.
+    if ! [[ "$skill" =~ ^[a-z0-9_][a-z0-9_-]*$ ]]; then
+      err "manifest contains suspicious skill name (skipping): $skill"
+      continue
+    fi
+    if [[ "${#only[@]}" -gt 0 ]]; then
+      local match=0
+      for k in "${only[@]}"; do [[ "$k" == "$skill" ]] && match=1; done
+      [[ "$match" -eq 1 ]] || continue
+    fi
+    if [[ -d ".claude/skills/$skill" ]]; then
+      rm -rf ".claude/skills/$skill"
+      count=$((count+1))
+    fi
+  done
+
+  if [[ "${#only[@]}" -eq 0 ]]; then
+    rm -f "$manifest"
+    echo "✓ removed $count skills + manifest"
+  else
+    echo "✓ removed $count skills (manifest preserved)"
+  fi
+}
+
+cmd_skills() {
+  local sub="${1:-}"
+  case "$sub" in
+    install)   shift; cmd_skills_install "$@" ;;
+    uninstall) shift; cmd_skills_uninstall "$@" ;;
+    ''|-h|--help|help) print_skills_help ;;
+    *) die "unknown skills subcommand '$sub'. usage: gwx skills <install|uninstall>" 2 ;;
+  esac
+}
+
+main() {
+  local first="${1:-}"
+  case "$first" in
+    ''|--help|-h|help)   print_help ;;
+    --version)           echo "gwx 0.1.0" ;;
+    init)                shift; cmd_init "$@" ;;
+    login)               shift; cmd_login "$@" ;;
+    logout)              shift; cmd_logout "$@" ;;
+    remove)              shift; cmd_remove "$@" ;;
+    whoami)              shift; cmd_whoami "$@" ;;
+    skills)              shift; cmd_skills "$@" ;;
+    *)                   dispatch "$@" ;;
+  esac
+}
+
+main "$@"
