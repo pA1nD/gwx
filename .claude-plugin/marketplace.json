@@ -1,0 +1,12 @@
+{
+  "name": "gwx-marketplace",
+  "owner": {
+    "name": "pA1nD"
+  },
+  "plugins": [
+    {
+      "name": "gwx",
+      "source": "."
+    }
+  ]
+}
