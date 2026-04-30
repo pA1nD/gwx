@@ -443,14 +443,29 @@ cmd_login() {
 
   # Run as child (not exec) so we can detect keychain failures and
   # transparently retry with the file backend if needed.
+  #
+  # Stream both streams LIVE to the user — gws prints the OAuth URL prompt
+  # on stderr, so any buffering would make login look hung until after the
+  # process exits. We need that stderr both visible (to the user) AND
+  # captured (to grep for the keyring-failure pattern). Pattern: a fd swap
+  # routes gws's stdout straight to the terminal; gws's stderr enters a
+  # foreground pipe to tee, which writes both to the capture file and back
+  # out to the terminal. Foreground pipe → tee has fully flushed by the
+  # time the pipeline exits, so the post-run grep sees a complete file.
+  #
+  # set +e window: with `set -euo pipefail` (top of script), a failing gws
+  # in a pipeline kills the function immediately — but a keyring failure
+  # IS the case we want to handle here. Drop -e for the pipeline only,
+  # capture PIPESTATUS, then restore. (`|| true` and `|| _x=$?` both reset
+  # PIPESTATUS to 0 on macOS bash, so they aren't viable substitutes.)
   local rc=0 err_file
   err_file=$(mktemp)
-  "$GWS_BIN" auth login 2>"$err_file" || rc=$?
-  # Replay buffered stderr so the user still sees "Using keyring backend:"
-  # noise + any real error. Buffering is necessary because we need to grep
-  # for the keychain failure pattern after the fact, and process-substitution
-  # tee races with the parent shell on small files.
-  [[ -s "$err_file" ]] && cat "$err_file" >&2
+  exec 4>&1
+  set +e
+  { "$GWS_BIN" auth login 2>&1 1>&4 4>&-; } | tee "$err_file" >&2
+  rc=${PIPESTATUS[0]}
+  set -e
+  exec 4>&-
 
   # Auto-fallback: macOS Keychain rejects writes from ad-hoc-signed gws
   # binaries (errSecInternalError, surfaced as "OS keyring failed"). When

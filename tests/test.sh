@@ -317,6 +317,65 @@ else
 fi
 rm -f "$GWX_HOME/accounts/foo/keyring_backend"
 
+# --- cmd_login: auto-fallback on OS keychain failure --------------------------
+# Fake `gws auth login` that mimics the macOS keychain failure on the first
+# call (no env var set) and succeeds on the second (env var=file). Verifies
+# the wrapper detects the pattern, retries, persists the pref, AND that the
+# OAuth URL prompt was streamed live (not buffered until after exit).
+
+FAKE_LOGIN="$TMP/fake-login"
+mkdir -p "$FAKE_LOGIN"
+cat > "$FAKE_LOGIN/gws" <<'FAKE'
+#!/usr/bin/env bash
+# Mark on disk that we ran, so the test can confirm a 2nd invocation occurred.
+echo "$GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND" >> "$GWX_TEST_GWS_LOG"
+echo "Open this URL: https://example.com/auth"   # live URL prompt (stderr)
+if [[ "${GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND:-}" == "file" ]]; then
+  echo "✓ logged in (file backend)"
+  exit 0
+fi
+echo "OAuth flow failed: Error while setting token in cache: OS keyring failed: Platform secure storage failure: An internal error has occurred." >&2
+exit 1
+FAKE
+chmod +x "$FAKE_LOGIN/gws"
+
+bump_test
+GWX_TEST_GWS_LOG="$TMP/gws-calls.log"
+: > "$GWX_TEST_GWS_LOG"
+export GWX_TEST_GWS_LOG
+login_out=$(PATH="$FAKE_LOGIN:$PATH" "$GWX" login foo 2>&1)
+login_exit=$?
+calls=$(wc -l < "$GWX_TEST_GWS_LOG" | tr -d ' ')
+pref_val="$(cat "$GWX_HOME/accounts/foo/keyring_backend" 2>/dev/null || echo MISSING)"
+if [[ "$login_exit" -eq 0 ]] \
+   && [[ "$calls" == "2" ]] \
+   && grep -q 'falling back to file-based key storage' <<<"$login_out" \
+   && grep -q 'Open this URL' <<<"$login_out" \
+   && [[ "$pref_val" == "file" ]]; then
+  ok_test "cmd_login: auto-fallback on keychain failure (retries + persists pref)"
+else
+  fail_test "cmd_login fallback failed. exit=$login_exit calls=$calls pref=$pref_val output=$login_out"
+fi
+rm -f "$GWX_HOME/accounts/foo/keyring_backend"
+
+# Re-run with pref already set: must NOT retry, must use file backend on first try.
+bump_test
+echo 'file' > "$GWX_HOME/accounts/foo/keyring_backend"
+chmod 600 "$GWX_HOME/accounts/foo/keyring_backend"
+: > "$GWX_TEST_GWS_LOG"
+login_out2=$(PATH="$FAKE_LOGIN:$PATH" "$GWX" login foo 2>&1)
+login_exit2=$?
+calls2=$(wc -l < "$GWX_TEST_GWS_LOG" | tr -d ' ')
+if [[ "$login_exit2" -eq 0 ]] \
+   && [[ "$calls2" == "1" ]] \
+   && ! grep -q 'falling back' <<<"$login_out2"; then
+  ok_test "cmd_login: existing pref skips probe (single-call path)"
+else
+  fail_test "cmd_login pref-skip failed. exit=$login_exit2 calls=$calls2 output=$login_out2"
+fi
+rm -f "$GWX_HOME/accounts/foo/keyring_backend"
+unset GWX_TEST_GWS_LOG
+
 echo
 if [[ "$fails" -eq 0 ]]; then
   printf '%sall %d tests passed%s\n' "$c_green" "$total" "$c_reset"
