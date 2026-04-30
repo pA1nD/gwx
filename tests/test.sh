@@ -304,18 +304,32 @@ else
   fail_test "scoped_env: expected KEYRING_BACKEND=NONE, got: $foo_default"
 fi
 
-# With keyring_backend=file pref → exported as GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND.
-# This is the path cmd_login persists after a keychain-write failure.
+# With per-account keyring_backend=file pref → exported as
+# GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND. Per-account is the explicit
+# override path.
 bump_test
 echo 'file' > "$GWX_HOME/accounts/foo/keyring_backend"
 chmod 600 "$GWX_HOME/accounts/foo/keyring_backend"
 foo_pref=$(PATH="$FAKE_BIN:$PATH" "$GWX" foo dummy-cmd 2>/dev/null)
 if grep -q 'KEYRING_BACKEND=file' <<<"$foo_pref"; then
-  ok_test "scoped_env: keyring_backend=file pref exported to gws"
+  ok_test "scoped_env: per-account pref=file exported to gws"
 else
   fail_test "scoped_env: expected KEYRING_BACKEND=file, got: $foo_pref"
 fi
 rm -f "$GWX_HOME/accounts/foo/keyring_backend"
+
+# Global pref alone → still exported. This is the typical case (cmd_login
+# probes once per machine, writes here, every account benefits).
+bump_test
+echo 'file' > "$GWX_HOME/keyring_backend"
+chmod 600 "$GWX_HOME/keyring_backend"
+foo_global=$(PATH="$FAKE_BIN:$PATH" "$GWX" foo dummy-cmd 2>/dev/null)
+if grep -q 'KEYRING_BACKEND=file' <<<"$foo_global"; then
+  ok_test "scoped_env: global pref=file exported to gws"
+else
+  fail_test "scoped_env: expected KEYRING_BACKEND=file from global pref, got: $foo_global"
+fi
+rm -f "$GWX_HOME/keyring_backend"
 
 # --- cmd_login: auto-fallback on OS keychain failure --------------------------
 # Fake `gws auth login` that mimics the macOS keychain failure on the first
@@ -339,41 +353,79 @@ exit 1
 FAKE
 chmod +x "$FAKE_LOGIN/gws"
 
+# Hide host codesign so the pre-probe can't see the real gws binary signature
+# during these tests — we want to exercise the post-failure fallback path
+# specifically. PROBE_BIN with no codesign = probe returns 1 = fallback runs.
+PROBE_BIN="$TMP/probe-bin"
+mkdir -p "$PROBE_BIN"
+
 bump_test
 GWX_TEST_GWS_LOG="$TMP/gws-calls.log"
 : > "$GWX_TEST_GWS_LOG"
 export GWX_TEST_GWS_LOG
-login_out=$(PATH="$FAKE_LOGIN:$PATH" "$GWX" login foo 2>&1)
+login_out=$(PATH="$PROBE_BIN:$FAKE_LOGIN:$PATH" "$GWX" login foo 2>&1)
 login_exit=$?
 calls=$(wc -l < "$GWX_TEST_GWS_LOG" | tr -d ' ')
-pref_val="$(cat "$GWX_HOME/accounts/foo/keyring_backend" 2>/dev/null || echo MISSING)"
+pref_val="$(cat "$GWX_HOME/keyring_backend" 2>/dev/null || echo MISSING)"
 if [[ "$login_exit" -eq 0 ]] \
    && [[ "$calls" == "2" ]] \
    && grep -q 'falling back to file-based key storage' <<<"$login_out" \
    && grep -q 'Open this URL' <<<"$login_out" \
    && [[ "$pref_val" == "file" ]]; then
-  ok_test "cmd_login: auto-fallback on keychain failure (retries + persists pref)"
+  ok_test "cmd_login: post-failure fallback (retries + persists global pref)"
 else
   fail_test "cmd_login fallback failed. exit=$login_exit calls=$calls pref=$pref_val output=$login_out"
 fi
-rm -f "$GWX_HOME/accounts/foo/keyring_backend"
+rm -f "$GWX_HOME/keyring_backend"
 
-# Re-run with pref already set: must NOT retry, must use file backend on first try.
+# Re-run with global pref already set: must NOT retry, must use file backend
+# on first try (single-call path — the typical case after a fresh install).
 bump_test
-echo 'file' > "$GWX_HOME/accounts/foo/keyring_backend"
-chmod 600 "$GWX_HOME/accounts/foo/keyring_backend"
+echo 'file' > "$GWX_HOME/keyring_backend"
+chmod 600 "$GWX_HOME/keyring_backend"
 : > "$GWX_TEST_GWS_LOG"
-login_out2=$(PATH="$FAKE_LOGIN:$PATH" "$GWX" login foo 2>&1)
+login_out2=$(PATH="$PROBE_BIN:$FAKE_LOGIN:$PATH" "$GWX" login foo 2>&1)
 login_exit2=$?
 calls2=$(wc -l < "$GWX_TEST_GWS_LOG" | tr -d ' ')
 if [[ "$login_exit2" -eq 0 ]] \
    && [[ "$calls2" == "1" ]] \
    && ! grep -q 'falling back' <<<"$login_out2"; then
-  ok_test "cmd_login: existing pref skips probe (single-call path)"
+  ok_test "cmd_login: existing global pref → single-call path"
 else
   fail_test "cmd_login pref-skip failed. exit=$login_exit2 calls=$calls2 output=$login_out2"
 fi
-rm -f "$GWX_HOME/accounts/foo/keyring_backend"
+rm -f "$GWX_HOME/keyring_backend"
+
+# Pre-probe path: faked uname=Darwin + codesign reports adhoc → probe fires,
+# global pref written, gws called ONCE with file backend (no double-flow).
+bump_test
+PROBE_BIN2="$TMP/probe-bin2"
+mkdir -p "$PROBE_BIN2"
+cat > "$PROBE_BIN2/uname" <<'U'
+#!/usr/bin/env bash
+[[ "$1" == "-s" ]] && echo "Darwin" || /usr/bin/uname "$@"
+U
+cat > "$PROBE_BIN2/codesign" <<'C'
+#!/usr/bin/env bash
+echo "Signature=adhoc" >&2
+exit 0
+C
+chmod +x "$PROBE_BIN2/uname" "$PROBE_BIN2/codesign"
+
+: > "$GWX_TEST_GWS_LOG"
+login_out3=$(PATH="$PROBE_BIN2:$FAKE_LOGIN:$PATH" "$GWX" login foo 2>&1)
+login_exit3=$?
+calls3=$(wc -l < "$GWX_TEST_GWS_LOG" | tr -d ' ')
+pref_val3="$(cat "$GWX_HOME/keyring_backend" 2>/dev/null || echo MISSING)"
+if [[ "$login_exit3" -eq 0 ]] \
+   && [[ "$calls3" == "1" ]] \
+   && grep -q 'Detected ad-hoc-signed gws binary' <<<"$login_out3" \
+   && [[ "$pref_val3" == "file" ]]; then
+  ok_test "cmd_login: pre-probe detects adhoc-signed gws → single flow"
+else
+  fail_test "cmd_login pre-probe failed. exit=$login_exit3 calls=$calls3 pref=$pref_val3 output=$login_out3"
+fi
+rm -f "$GWX_HOME/keyring_backend"
 unset GWX_TEST_GWS_LOG
 
 echo

@@ -167,12 +167,15 @@ EXIT CODES
 CONFIG
   ~/.config/gwx/                       wrapper home (mode 0700)
   ~/.config/gwx/accounts.list          one account alias per line
+  ~/.config/gwx/keyring_backend  (0600) machine-wide: present iff gws's
+                                        AES key store is file-based (auto-set
+                                        when OS keychain writes would fail)
   ~/.config/gwx/accounts/<name>/       per-account home (0700)
     ├── client.env       (0600)        OAuth client_id + secret
     ├── credentials.enc  (0600)        refresh token, AES-256-GCM
     ├── token_cache.json (0600)        access token, encrypted
-    └── keyring_backend  (0600)        present iff fell back to file-based
-                                       AES-key storage (vs OS keychain)
+    └── keyring_backend  (0600)        per-account override of the global
+                                       backend choice (rarely needed)
   ~/.cache/gwx/skills-src/           shallow clone of gws repo (skills source)
   <cwd>/.claude/skills/<name>/       rewritten skills (per agent project)
   <cwd>/.claude/skills/.gwx-manifest.json   tracks installed skills + SHA
@@ -210,10 +213,12 @@ Run once per account. Tokens are AES-256-GCM-encrypted at rest; the key lives
 in your OS secret store (macOS Keychain / Windows Credential Manager / Linux
 file fallback).
 
-If the OS keychain rejects the write (common with ad-hoc-signed gws binaries
-on macOS), gwx auto-falls-back to file-based key storage and persists the
-choice in ~/.config/gwx/accounts/<name>/keyring_backend. Logging out clears
-the pref so a future login re-probes the keychain.
+On first login, gwx checks whether the gws binary is ad-hoc-signed on macOS
+(Keychain writes will provably fail in that case, errSecInternalError) and
+pre-emptively switches to file-based key storage. The choice is persisted
+in ~/.config/gwx/keyring_backend so every other account on this machine
+also skips the broken first OAuth flow. To force a keychain re-probe,
+delete that file before the next login.
 EOF
       ;;
     logout) cat <<'EOF'
@@ -412,20 +417,52 @@ scoped_env() {
   # store. On Linux, gws's keyring path is compiled out and it uses the
   # file backend regardless.
   #
-  # Per-account override: if cmd_login auto-fell-back to file storage (the
-  # OS keychain rejected the write — common with ad-hoc-signed gws binaries
-  # on modern macOS), it persisted "file" in this pref file. We must read
-  # back the SAME backend on every subsequent gws call, otherwise the AES
-  # key lookup would target the wrong store and the encrypted creds would
-  # be unreadable.
-  local pref="$GWX_ACCOUNTS_DIR/$account/keyring_backend"
-  if [[ -f "$pref" ]]; then
-    local backend
-    backend="$(cat "$pref" 2>/dev/null || true)"
-    if [[ "$backend" == "file" ]]; then
-      export GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file
-    fi
+  # Override hierarchy (per-account first, global second). The keyring
+  # backend is a machine-wide property: cmd_login probes once per machine
+  # and persists "file" in $GWX_HOME/keyring_backend if the OS keychain
+  # is broken (typical: ad-hoc-signed gws on modern macOS), so every
+  # account skips that broken first flow. The per-account pref is a niche
+  # explicit override — useful if a single account needs a different
+  # backend than the rest.
+  local backend=""
+  local per_account="$GWX_ACCOUNTS_DIR/$account/keyring_backend"
+  local global_pref="$GWX_HOME/keyring_backend"
+  if [[ -f "$per_account" ]]; then
+    backend="$(cat "$per_account" 2>/dev/null || true)"
+  elif [[ -f "$global_pref" ]]; then
+    backend="$(cat "$global_pref" 2>/dev/null || true)"
   fi
+  if [[ "$backend" == "file" ]]; then
+    export GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file
+  fi
+}
+
+# gws_keychain_likely_broken: heuristic probe — returns 0 (broken) when
+# the installed gws binary is ad-hoc-signed on macOS, which is the
+# textbook recipe for `errSecInternalError` on every Keychain write.
+# Returns 1 (probably fine) on Linux, Windows, or properly-signed
+# binaries — i.e. we still try keychain first in those cases.
+#
+# Used at first login to skip the doomed first OAuth flow on machines
+# where keychain writes will provably fail. Result is cached in
+# $GWX_HOME/keyring_backend, so the probe runs at most once per machine.
+gws_keychain_likely_broken() {
+  [[ "$(uname -s)" == "Darwin" ]] || return 1
+  resolve_gws_bin
+  [[ -n "$GWS_BIN" ]] || return 1
+
+  # gws_bin may point at a Node entry shim (run.js) that platform-detects
+  # and execs the native binary at <pkg>/bin/gws. Probe the native binary,
+  # not the shim — the shim is JS and codesign won't tell us anything.
+  local probe="$GWS_BIN"
+  if [[ "$probe" == *.js ]]; then
+    local sib="$(dirname "$probe")/bin/gws"
+    [[ -f "$sib" ]] && probe="$sib"
+  fi
+
+  have codesign || return 1
+  codesign -dv "$probe" 2>&1 | grep -q 'Signature=adhoc' && return 0
+  return 1
 }
 
 cmd_login() {
@@ -440,6 +477,26 @@ cmd_login() {
   is_account "$account" || die "unknown account '$account'. valid: ${ACCOUNTS[*]}" 2
   ensure_gws
   scoped_env "$account"
+
+  # Pre-probe: on macOS with ad-hoc-signed gws, OS keychain writes are
+  # near-certain to fail. Skip a doomed first OAuth flow by switching to
+  # file backend up-front and persisting the global pref so every other
+  # account on this machine also goes single-flow. scoped_env may have
+  # already exported the env var (existing pref); only probe when it
+  # didn't.
+  local global_pref="$GWX_HOME/keyring_backend"
+  if [[ ! -f "$global_pref" ]] \
+     && [[ "${GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND:-}" != "file" ]] \
+     && gws_keychain_likely_broken; then
+    err "Detected ad-hoc-signed gws binary on macOS — OS keychain writes would fail."
+    err "Defaulting to file-based key storage to avoid a doomed first OAuth flow."
+    err "  ↳ security note: AES key sits at <account>/.encryption_key (mode 0600),"
+    err "    still AES-256-GCM at rest, but weaker than keychain."
+    echo >&2
+    printf 'file\n' > "$global_pref"
+    chmod 600 "$global_pref"
+    export GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file
+  fi
 
   # Run as child (not exec) so we can detect keychain failures and
   # transparently retry with the file backend if needed.
@@ -467,17 +524,12 @@ cmd_login() {
   set -e
   exec 4>&-
 
-  # Auto-fallback: macOS Keychain rejects writes from ad-hoc-signed gws
-  # binaries (errSecInternalError, surfaced as "OS keyring failed"). When
-  # we hit that AND there's no existing pref (so we haven't already fallen
-  # back for this account), retry with file-based key storage and persist
-  # the choice so future calls go straight to file backend.
-  #
-  # Cost: user re-does the OAuth flow once. Benefit: no manual env-var
-  # juggling, downgraded but still-encrypted creds, and a clear note about
-  # the security tradeoff.
-  local pref="$GWX_ACCOUNTS_DIR/$account/keyring_backend"
-  if [[ "$rc" -ne 0 && ! -f "$pref" ]] \
+  # Safety-net fallback: the pre-probe missed this case (signed binary
+  # that still has keychain trouble, or some non-macOS edge case), but
+  # the live error matches the keyring-failure pattern. Retry once with
+  # file backend and persist the global pref so every other account on
+  # this machine skips the failure entirely. User pays one double-flow.
+  if [[ "$rc" -ne 0 && ! -f "$global_pref" ]] \
      && grep -qE 'OS keyring failed|Platform secure storage failure' "$err_file" 2>/dev/null; then
     echo >&2
     err "OS keychain rejected the write — falling back to file-based key storage."
@@ -490,8 +542,8 @@ cmd_login() {
     rc=0
     "$GWS_BIN" auth login || rc=$?
     if [[ "$rc" -eq 0 ]]; then
-      printf 'file\n' > "$pref"
-      chmod 600 "$pref"
+      printf 'file\n' > "$global_pref"
+      chmod 600 "$global_pref"
     fi
   fi
   rm -f "$err_file"
