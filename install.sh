@@ -240,6 +240,16 @@ cmd_install() {
     printf '%s\n' "$gws_pin" > "$GWX_CONFIG_DIR/gws_bin"
     chmod 600 "$GWX_CONFIG_DIR/gws_bin"
     ok "pinned gws path: $gws_pin"
+
+    # Clear the cached keyring-backend probe result. The pref records what
+    # the *previous* gws binary's codesign supported; a reinstall may have
+    # swapped the binary (different version, different arch, different
+    # signing), so the next login should re-probe rather than trust the
+    # stale answer. Per-account overrides are preserved.
+    if [[ -f "$GWX_CONFIG_DIR/keyring_backend" ]]; then
+      rm -f "$GWX_CONFIG_DIR/keyring_backend"
+      note "cleared cached keyring-backend probe (will re-probe on next login)"
+    fi
   fi
 
   # Permission deny
@@ -292,6 +302,19 @@ cmd_uninstall() {
   if [[ -d "$GWX_PREFIX" ]]; then
     rm -rf "$GWX_PREFIX"
     ok "removed $GWX_PREFIX"
+  fi
+
+  # Always drop the cached keyring-backend probe and pinned gws path even
+  # without --purge: both are install-state (pointer + probe result for
+  # the gws binary at install time), not user data. Leaving them behind
+  # would mislead a future fresh install.
+  if [[ -f "$GWX_CONFIG_DIR/keyring_backend" ]]; then
+    rm -f "$GWX_CONFIG_DIR/keyring_backend"
+    ok "cleared cached keyring-backend probe"
+  fi
+  if [[ -f "$GWX_CONFIG_DIR/gws_bin" ]]; then
+    rm -f "$GWX_CONFIG_DIR/gws_bin"
+    ok "cleared pinned gws path"
   fi
 
   if [[ "$PURGE" -eq 1 ]]; then
