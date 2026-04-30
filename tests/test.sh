@@ -266,6 +266,7 @@ cat > "$FAKE_BIN/gws" <<'FAKE'
 #!/usr/bin/env bash
 echo "CLIENT_ID=${GOOGLE_WORKSPACE_CLI_CLIENT_ID:-NONE}"
 echo "CONFIG_DIR=${GOOGLE_WORKSPACE_CLI_CONFIG_DIR:-NONE}"
+echo "KEYRING_BACKEND=${GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND:-NONE}"
 exit 0
 FAKE
 chmod +x "$FAKE_BIN/gws"
@@ -292,6 +293,29 @@ if [[ "$bar_exit" -eq 4 ]] && grep -q 'no OAuth client' <<<"$bar_out"; then
 else
   fail_test "scoped_env: bar should exit 4 with 'no OAuth client', got exit=$bar_exit, output: $bar_out"
 fi
+
+# Default: no keyring_backend pref → KEYRING_BACKEND env var unset (gws picks
+# its own default, i.e. OS keychain on macOS/Windows).
+bump_test
+foo_default=$(PATH="$FAKE_BIN:$PATH" "$GWX" foo dummy-cmd 2>/dev/null)
+if grep -q 'KEYRING_BACKEND=NONE' <<<"$foo_default"; then
+  ok_test "scoped_env: no pref → keyring backend left to gws default"
+else
+  fail_test "scoped_env: expected KEYRING_BACKEND=NONE, got: $foo_default"
+fi
+
+# With keyring_backend=file pref → exported as GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND.
+# This is the path cmd_login persists after a keychain-write failure.
+bump_test
+echo 'file' > "$GWX_HOME/accounts/foo/keyring_backend"
+chmod 600 "$GWX_HOME/accounts/foo/keyring_backend"
+foo_pref=$(PATH="$FAKE_BIN:$PATH" "$GWX" foo dummy-cmd 2>/dev/null)
+if grep -q 'KEYRING_BACKEND=file' <<<"$foo_pref"; then
+  ok_test "scoped_env: keyring_backend=file pref exported to gws"
+else
+  fail_test "scoped_env: expected KEYRING_BACKEND=file, got: $foo_pref"
+fi
+rm -f "$GWX_HOME/accounts/foo/keyring_backend"
 
 echo
 if [[ "$fails" -eq 0 ]]; then

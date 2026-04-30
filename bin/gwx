@@ -170,7 +170,9 @@ CONFIG
   ~/.config/gwx/accounts/<name>/       per-account home (0700)
     ├── client.env       (0600)        OAuth client_id + secret
     ├── credentials.enc  (0600)        refresh token, AES-256-GCM
-    └── token_cache.json (0600)        access token, encrypted
+    ├── token_cache.json (0600)        access token, encrypted
+    └── keyring_backend  (0600)        present iff fell back to file-based
+                                       AES-key storage (vs OS keychain)
   ~/.cache/gwx/skills-src/           shallow clone of gws repo (skills source)
   <cwd>/.claude/skills/<name>/       rewritten skills (per agent project)
   <cwd>/.claude/skills/.gwx-manifest.json   tracks installed skills + SHA
@@ -207,6 +209,11 @@ USAGE
 Run once per account. Tokens are AES-256-GCM-encrypted at rest; the key lives
 in your OS secret store (macOS Keychain / Windows Credential Manager / Linux
 file fallback).
+
+If the OS keychain rejects the write (common with ad-hoc-signed gws binaries
+on macOS), gwx auto-falls-back to file-based key storage and persists the
+choice in ~/.config/gwx/accounts/<name>/keyring_backend. Logging out clears
+the pref so a future login re-probes the keychain.
 EOF
       ;;
     logout) cat <<'EOF'
@@ -400,14 +407,25 @@ scoped_env() {
   source "$client"
   set +a
   export GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$GWX_ACCOUNTS_DIR/$account"
-  # Intentionally NOT setting GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND.
-  # gws's default ("keyring") uses macOS Keychain / Windows Credential Manager
-  # for the AES key — a real OS-level secret store. Forcing "file" would
-  # downgrade us to a key sitting next to the ciphertext (security theater).
-  # All gwx accounts share one keyring entry (gws-cli/<user>), which is fine:
-  # they all run as the same OS user, and ciphertexts stay isolated by
-  # per-account config dir. On Linux, gws's keyring path is compiled out
-  # and it uses the file backend regardless — no regression there.
+  # Default: leave GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND unset so gws uses
+  # macOS Keychain / Windows Credential Manager — a real OS-level secret
+  # store. On Linux, gws's keyring path is compiled out and it uses the
+  # file backend regardless.
+  #
+  # Per-account override: if cmd_login auto-fell-back to file storage (the
+  # OS keychain rejected the write — common with ad-hoc-signed gws binaries
+  # on modern macOS), it persisted "file" in this pref file. We must read
+  # back the SAME backend on every subsequent gws call, otherwise the AES
+  # key lookup would target the wrong store and the encrypted creds would
+  # be unreadable.
+  local pref="$GWX_ACCOUNTS_DIR/$account/keyring_backend"
+  if [[ -f "$pref" ]]; then
+    local backend
+    backend="$(cat "$pref" 2>/dev/null || true)"
+    if [[ "$backend" == "file" ]]; then
+      export GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file
+    fi
+  fi
 }
 
 cmd_login() {
@@ -423,10 +441,46 @@ cmd_login() {
   ensure_gws
   scoped_env "$account"
 
-  # Run as child (not exec) so we can append a next-step hint on success.
-  # Multi-account is gwx's whole point — nudge the user toward adding more.
-  local rc=0
-  "$GWS_BIN" auth login || rc=$?
+  # Run as child (not exec) so we can detect keychain failures and
+  # transparently retry with the file backend if needed.
+  local rc=0 err_file
+  err_file=$(mktemp)
+  "$GWS_BIN" auth login 2>"$err_file" || rc=$?
+  # Replay buffered stderr so the user still sees "Using keyring backend:"
+  # noise + any real error. Buffering is necessary because we need to grep
+  # for the keychain failure pattern after the fact, and process-substitution
+  # tee races with the parent shell on small files.
+  [[ -s "$err_file" ]] && cat "$err_file" >&2
+
+  # Auto-fallback: macOS Keychain rejects writes from ad-hoc-signed gws
+  # binaries (errSecInternalError, surfaced as "OS keyring failed"). When
+  # we hit that AND there's no existing pref (so we haven't already fallen
+  # back for this account), retry with file-based key storage and persist
+  # the choice so future calls go straight to file backend.
+  #
+  # Cost: user re-does the OAuth flow once. Benefit: no manual env-var
+  # juggling, downgraded but still-encrypted creds, and a clear note about
+  # the security tradeoff.
+  local pref="$GWX_ACCOUNTS_DIR/$account/keyring_backend"
+  if [[ "$rc" -ne 0 && ! -f "$pref" ]] \
+     && grep -qE 'OS keyring failed|Platform secure storage failure' "$err_file" 2>/dev/null; then
+    echo >&2
+    err "OS keychain rejected the write — falling back to file-based key storage."
+    err "  ↳ security note: the AES key now lives next to the encrypted creds at"
+    err "    $GWX_ACCOUNTS_DIR/$account/.encryption_key (mode 0600), not in your"
+    err "    OS secret store. Still AES-256-GCM at rest, but weaker than keychain."
+    err "  ↳ please complete the OAuth flow one more time."
+    echo >&2
+    export GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file
+    rc=0
+    "$GWS_BIN" auth login || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      printf 'file\n' > "$pref"
+      chmod 600 "$pref"
+    fi
+  fi
+  rm -f "$err_file"
+
   if [[ "$rc" -eq 0 ]]; then
     echo
     echo "Next: add another account →  gwx init <name>"
@@ -476,7 +530,7 @@ cmd_logout() {
   fi
   is_account "$account" || die "unknown account '$account'. valid: ${ACCOUNTS[*]}" 2
   local dir="$GWX_ACCOUNTS_DIR/$account"
-  rm -f "$dir/credentials.enc" "$dir/token_cache.json" "$dir/sa_token_cache.json" "$dir/.encryption_key" "$dir/client_secret.json"
+  rm -f "$dir/credentials.enc" "$dir/token_cache.json" "$dir/sa_token_cache.json" "$dir/.encryption_key" "$dir/client_secret.json" "$dir/keyring_backend"
   echo "✓ removed credentials for '$account' (dir kept: $dir)"
 }
 
