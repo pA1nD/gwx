@@ -19,8 +19,6 @@
 #   --version REF             git ref to install (branch/tag/commit, default: main)
 #   --non-interactive         no prompts, take all defaults
 #   --with-gws | --no-gws     install gws via npm (or skip), no prompt
-#   --with-permission-deny    add 'Bash(gws *)' deny to user settings.json
-#   --no-permission-deny      skip the deny prompt
 #   --purge                   uninstall: also wipe ~/.config/gwx (asks for confirm)
 #   -h, --help                show this help
 #
@@ -51,14 +49,13 @@ err()  { printf 'install: %s\n' "$*" >&2; }
 die()  { err "$1"; exit "${2:-1}"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-print_install_help() { sed -n '2,28p' "$0" | sed -E 's/^# ?//'; }
+print_install_help() { sed -n '2,26p' "$0" | sed -E 's/^# ?//'; }
 
 # --- arg parsing ---------------------------------------------------------------
 
 FROM_FOLDER=""
 NON_INTERACTIVE=0
 WITH_GWS="ask"
-WITH_PERMISSION_DENY="ask"
 PURGE=0
 
 # First positional is the verb
@@ -80,8 +77,6 @@ while [[ $# -gt 0 ]]; do
     --non-interactive)      NON_INTERACTIVE=1; shift ;;
     --with-gws)             WITH_GWS=yes; shift ;;
     --no-gws)               WITH_GWS=no; shift ;;
-    --with-permission-deny) WITH_PERMISSION_DENY=yes; shift ;;
-    --no-permission-deny)   WITH_PERMISSION_DENY=no; shift ;;
     --purge)                PURGE=1; shift ;;
     -h|--help)              print_install_help; exit 0 ;;
     *) die "unknown flag: $1 (run './install.sh --help')" 2 ;;
@@ -141,25 +136,6 @@ install_gws() {
     warn "brew install failed"; return 1
   fi
   warn "no supported package manager (npm or brew)"; return 1
-}
-
-add_permission_deny() {
-  local settings="$HOME/.claude/settings.json"
-  mkdir -p "$HOME/.claude"
-  if ! have jq; then
-    warn "jq not installed — skipping permission deny"
-    note "add manually: \"permissions\": { \"deny\": [\"Bash(gws *)\"] } in $settings"
-    return 1
-  fi
-  if [[ ! -f "$settings" ]]; then
-    echo '{}' > "$settings"
-  fi
-  # mktemp gives us an unguessable temp path beside the target — kills
-  # the symlink-race that a predictable "$settings.tmp.$$" would invite.
-  local tmp; tmp=$(mktemp "$settings.XXXXXX")
-  jq '.permissions.deny = ((.permissions.deny // []) + ["Bash(gws *)", "Bash(*/gws *)"] | unique)' "$settings" > "$tmp" \
-    && mv "$tmp" "$settings" \
-    && ok "added gws deny rules to $settings"
 }
 
 # --- verbs ---------------------------------------------------------------------
@@ -241,28 +217,15 @@ cmd_install() {
     chmod 600 "$GWX_CONFIG_DIR/gws_bin"
     ok "pinned gws path: $gws_pin"
 
-    # Clear the cached keyring-backend probe result. The pref records what
-    # the *previous* gws binary's codesign supported; a reinstall may have
-    # swapped the binary (different version, different arch, different
-    # signing), so the next login should re-probe rather than trust the
-    # stale answer. Per-account overrides are preserved.
-    if [[ -f "$GWX_CONFIG_DIR/keyring_backend" ]]; then
-      rm -f "$GWX_CONFIG_DIR/keyring_backend"
-      note "cleared cached keyring-backend probe (will re-probe on next login)"
-    fi
+    # Leave keyring_backend alone on reinstall. It's not a cache — it's
+    # the gate to the AES key that decrypts existing creds. Earlier
+    # versions of this script cleared it on every install to "force a
+    # re-probe," but the cost was that any non-login op (whoami, gmail
+    # fetch) done first would silently fail to decrypt. The rare
+    # "binary signing changed, pref is stale" case is already handled
+    # by the safety-net retry in cmd_login (bin/gwx) — that fallback
+    # rewrites the pref on the spot.
   fi
-
-  # Permission deny
-  echo
-  case "$WITH_PERMISSION_DENY" in
-    yes) add_permission_deny || true ;;
-    no)  note "permission deny skipped" ;;
-    ask)
-      if [[ "$(prompt_yn 'Block raw \`gws\` calls in Claude Code (recommended)? [Y/n]:' y)" == yes ]]; then
-        add_permission_deny || true
-      fi
-      ;;
-  esac
 
   echo
   if [[ -f "$GWX_CONFIG_DIR/accounts.list" ]]; then
@@ -304,14 +267,13 @@ cmd_uninstall() {
     ok "removed $GWX_PREFIX"
   fi
 
-  # Always drop the cached keyring-backend probe and pinned gws path even
-  # without --purge: both are install-state (pointer + probe result for
-  # the gws binary at install time), not user data. Leaving them behind
-  # would mislead a future fresh install.
-  if [[ -f "$GWX_CONFIG_DIR/keyring_backend" ]]; then
-    rm -f "$GWX_CONFIG_DIR/keyring_backend"
-    ok "cleared cached keyring-backend probe"
-  fi
+  # Drop the pinned gws path even without --purge: it's a pointer to the
+  # gws binary at install time and a future fresh install rewrites it.
+  # Do NOT drop keyring_backend — that one is the gate to the AES key
+  # for existing encrypted creds. Clearing it without --purge would mean
+  # `uninstall && reinstall` (a common upgrade pattern when not using
+  # `update`) silently breaks every account on the next non-login op.
+  # Under --purge the whole config dir gets wiped below anyway.
   if [[ -f "$GWX_CONFIG_DIR/gws_bin" ]]; then
     rm -f "$GWX_CONFIG_DIR/gws_bin"
     ok "cleared pinned gws path"

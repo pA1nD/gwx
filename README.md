@@ -214,32 +214,25 @@ gwx repo is its own marketplace):
 After that, the `gwx:cli` skill is available everywhere — no
 `--plugin-dir` flag needed.
 
-### Block raw `gws` (lock agents to gwx)
+### Keeping agents on the wrapper
 
 `gwx`'s account isolation only holds if the agent goes _through_ the
 wrapper. If an agent shells out to `gws gmail users messages send ...`
 directly, account selection drops out and you're back to whatever
-account `gws` defaulted to. Deny `gws` at the permission layer:
+account `gws` defaulted to.
 
-```json
-{
-  "permissions": {
-    "deny": ["Bash(gws *)", "Bash(*/gws *)"]
-  }
-}
-```
+The skill files installed by `gwx skills install` carry the rule
+inline: the `gwx-cli` skill has a "Never call `gws` directly" section,
+and every rewritten `gws-*` skill is prefixed with a banner that
+repeats it. That's the enforcement — instruction-level, not
+policy-level.
 
-Drop that into `~/.claude/settings.json` (global) or a project's
-`.claude/settings.json` (per-project). The installer offers to add it
-for you on install (default Y); skip with `--no-permission-deny` if
-you'd rather not. Permissions propagate to subagents, so even delegated
-tasks can't bypass the rule.
-
-> **Honest limitation:** the deny is glob-based on the rendered command
-> string. It catches the common shapes (`gws ...`, `/usr/local/bin/gws ...`)
-> but a determined caller can still bypass it via `bash -c 'gws ...'`,
-> `command gws`, `$(which gws) ...`, etc. Treat this as a speed bump that
-> stops accidental drift, not as a security boundary.
+A `Bash(gws *)` deny rule in `~/.claude/settings.json` looks like
+extra defense, but in practice Claude Code's permission classifier
+treats `gws` as a substring of `gwx` and blocks legitimate wrapper
+calls. The skill-based rule is more reliable. If you still want the
+deny as belt-and-braces, add it manually — the installer no longer
+prompts for it.
 
 ## Powerful Agent Skills
 

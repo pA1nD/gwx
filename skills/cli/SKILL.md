@@ -63,13 +63,27 @@ names at the bottom under `CONFIGURED ACCOUNTS`. That's your single bootstrap
 call — you don't need a separate `gwx whoami` just to learn which accounts
 exist. (Use `whoami` only when you need auth status: ✓/✗/expired per account.)
 
-**Don't probe for installation.** If you're reading this skill, `gwx` is on
-the agent's `PATH`. Never run `which gwx`, `which gws`, `gws --version`, or
-any compound command containing the word `gws` — direct `gws` calls are
-deny'd by permission policy (the wrapper is the only sanctioned entry
-point) and even `which gws` chained with `;` will be rejected as a side
-effect. If `gwx --help` errors with "command not found", *then* report it
-back — but don't pre-flight check.
+## Never call `gws` directly
+
+`gwx` is the only correct entrypoint. **Do not** invoke `gws` (the wrapped
+CLI) on its own — not even for one-off reads, not even when the underlying
+gws docs show a bare `gws ...` example. Raw `gws` has no account context:
+it'll either error with "no config" or operate on whatever account got
+configured last. That is exactly how an agent ends up sending a work
+email from a personal address. The wrapper requiring `<account>` as the
+first arg is the **only** guardrail against that mistake; bypass it and
+the guardrail is gone.
+
+Concretely: rewrite every `gws X` you see in docs to `gwx <account> X`
+before running it. If you don't know the account, ask — don't guess and
+don't drop the wrapper.
+
+**Don't probe either.** If you're reading this skill, `gwx` is on `PATH`
+— skip `which gwx`, `which gws`, `gws --version`, and any "let me check
+it's installed first" call. They're wasted round-trips and `which gws`
+in particular tempts a follow-up raw-`gws` invocation. If `gwx --help`
+itself errors with "command not found", *then* report back — but don't
+pre-flight check.
 
 ## Discovering services and verbs
 

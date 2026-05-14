@@ -801,7 +801,7 @@ dispatch() {
 rewrite_skill() {
   local script
   IFS= read -r -d '' script <<'PERL' || true
-my $banner = "\n> **NOTE FOR AGENTS:** This skill describes the \x60gws\x60 CLI, but you must invoke commands as \x60gwx <account> ...\x60. Direct \x60gws\x60 is blocked by permission rules. See [googleworkspace/cli](https://github.com/googleworkspace/cli) for the underlying tool when debugging.\n";
+my $banner = "\n> **NOTE FOR AGENTS:** This skill describes the \x60gws\x60 CLI, but you must invoke commands as \x60gwx <account> ...\x60. Raw \x60gws\x60 has no account context — calling it directly will fail or hit the wrong account (e.g. work email from a personal address). The wrapper requiring an explicit \x60<account>\x60 is the only guardrail against that. See [googleworkspace/cli](https://github.com/googleworkspace/cli) for the underlying tool when debugging.\n";
 
 my ($fm_dashes, $fm_done, $in_code) = (0, 0, 0);
 while (<STDIN>) {
@@ -939,9 +939,28 @@ cmd_skills_install() {
   # skills assume is loaded. Without it, an agent in this directory has no
   # way to learn the multi-account contract from the project alone. Copy
   # verbatim (no rewrite — this is our skill, not upstream gws content).
+  # Resolve BASH_SOURCE[0] through symlinks before deriving the install
+  # prefix. The standard install puts bin/gwx behind a symlink (e.g.
+  # ~/.local/bin/gwx → ~/.local/share/gwx/bin/gwx); without resolving it,
+  # the relative "../skills/cli/SKILL.md" lands in the symlink's parent
+  # (~/.local/skills/...), which doesn't exist, so we'd silently fall
+  # through to the next candidate. That's invisible when the fallback
+  # happens to point at the same install — but it picks the wrong source
+  # any time the user runs a second install at a different prefix.
+  # Manual loop avoids depending on GNU `readlink -f` / macOS-only flags.
+  local src="${BASH_SOURCE[0]}"
+  while [[ -L "$src" ]]; do
+    local target
+    target="$(readlink "$src")"
+    if [[ "$target" = /* ]]; then src="$target"
+    else src="$(dirname "$src")/$target"; fi
+  done
+  local bin_dir
+  bin_dir="$(cd "$(dirname "$src")" && pwd -P)"
+
   local cli_src=""
   for candidate in \
-    "$(dirname "${BASH_SOURCE[0]}")/../skills/cli/SKILL.md" \
+    "$bin_dir/../skills/cli/SKILL.md" \
     "$HOME/.local/share/gwx/skills/cli/SKILL.md" \
     "/usr/local/share/gwx/skills/cli/SKILL.md"; do
     if [[ -f "$candidate" ]]; then cli_src="$candidate"; break; fi
